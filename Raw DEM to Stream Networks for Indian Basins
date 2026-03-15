@@ -1,0 +1,112 @@
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from pyproj import CRS
+import os
+import subprocess
+import whitebox
+
+# === INPUT PATHS ===
+basins_shapefile = r"D:\DEMS\Indian_river_basins\Indian_river_basins_lcc.shp"
+dem_path = r"D:\DEMS\india_lcc.tif" 
+output_dir = r"D:\DEMS\adani2"
+os.makedirs(output_dir, exist_ok=True)
+
+# Path to whitebox_tools.exe
+whitebox_exe = r"D:\TOOLS\WhiteboxTools_win_amd64\WBT\whitebox_tools.exe"
+
+# === WhiteboxTools API setup ===
+wbt = whitebox.WhiteboxTools()
+wbt.set_working_dir(output_dir)
+wbt.verbose = False
+
+# === Load shapefile and extract Cauvery basin ===
+basins = gpd.read_file(basins_shapefile)
+cauvery = basins[basins['ba_name'].str.lower().str.contains("west flowing rivers of kutch and saurashtra including luni")]   
+if cauvery.empty:
+    raise ValueError("Cauvery basin not found in shapefile")
+
+# === Clip DEM to Cauvery ===
+cauvery_geom = [cauvery.iloc[0].geometry]
+safe_name = "wfrks_luni"
+
+clipped_raw_dem = os.path.join(output_dir, f"{safe_name}_dem_raw.tif")
+filled_dem_path = os.path.join(output_dir, f"{safe_name}_dem_filled.tif")
+flow_dir_path = os.path.join(output_dir, f"{safe_name}_flowdir.tif")
+flow_acc_path = os.path.join(output_dir, f"{safe_name}_flowacc.tif")
+streams_raster_path = os.path.join(output_dir, f"{safe_name}_streams.tif")
+stream_order_path = os.path.join(output_dir, f"{safe_name}_stream_order.tif")
+vector_shp = os.path.join(output_dir, f"{safe_name}_streams_all.shp")
+streams_shapefile = os.path.join(output_dir, f"{safe_name}_streams_order1.shp")
+
+# === Step 1: Clip DEM ===
+with rasterio.open(dem_path) as src:
+    out_image, out_transform = mask(src, cauvery_geom, crop=True)
+    out_meta = src.meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": out_image.shape[1],
+        "width": out_image.shape[2],
+        "transform": out_transform
+    })
+    with rasterio.open(clipped_raw_dem, "w", **out_meta) as dest:
+        dest.write(out_image)
+
+print("[STEP 1] DEM clipped to Cauvery")
+
+# === Step 2: Fill DEM ===
+wbt.fill_depressions(clipped_raw_dem, filled_dem_path)
+print("[STEP 2] DEM filled")
+
+# === Step 3: Flow direction (D8) ===
+wbt.d8_pointer(filled_dem_path, flow_dir_path)
+print("[STEP 3] Flow direction created")
+
+# === Step 4: Flow accumulation ===
+wbt.d8_flow_accumulation(filled_dem_path, flow_acc_path, out_type="cells", log=False)
+print(f"[STEP 4] Flow accumulation raster saved: {flow_acc_path}")
+
+# === Step 5: Extract streams using threshold ===
+# wbt.extract_streams(flow_acc_path, streams_raster_path, threshold=4000)
+wbt.extract_streams(flow_acc_path, streams_raster_path, threshold=100)
+print("[STEP 5] Streams extracted")
+
+# === Step 6: Strahler Stream Order ===
+subprocess.run([
+    whitebox_exe,
+    "--run=StrahlerStreamOrder",
+    f"--d8_pntr={flow_dir_path}",
+    f"--streams={streams_raster_path}",
+    f"--output={stream_order_path}",
+    "--wd", output_dir,
+    "-v"
+], check=True)
+print("[STEP 6] Strahler stream order raster created")
+
+# === Step 7: Vectorize stream order raster ===
+wbt.raster_streams_to_vector(stream_order_path, flow_dir_path, vector_shp)
+print("[STEP 7] Vector stream network (.shp) created")
+
+# === Step 8: Filter stream order >= 1 ===
+streams_gdf = gpd.read_file(vector_shp)
+
+with rasterio.open(filled_dem_path) as src:
+    raster_crs = src.crs
+
+streams_gdf.set_crs(raster_crs, inplace=True)
+
+# Detect order column
+possible_cols = ['stream_order', 'strahler', 'order', 'STRM_VAL']
+order_col = next((col for col in possible_cols if col in streams_gdf.columns), None)
+if not order_col:
+    raise ValueError("No stream order column found in vector data.")
+
+streams_gdf = streams_gdf.rename(columns={order_col: 'stream_order'})
+filtered_streams = streams_gdf[streams_gdf['stream_order'] >= 1]
+
+# === Step 9: Reproject to WGS 84 ===
+filtered_streams = filtered_streams.to_crs(epsg=4326)
+
+# === Step 10: Save final stream shapefile ===
+filtered_streams.to_file(streams_shapefile)
+print(f"[DONE] Stream shapefile saved in WGS 84: {streams_shapefile}")
