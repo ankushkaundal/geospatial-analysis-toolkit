@@ -1,0 +1,318 @@
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+import os
+import numpy as np
+import whitebox
+from pyproj import CRS
+from multiprocessing import Pool, cpu_count
+import time
+from functools import partial
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# === INPUT PATHS ===
+basins_shapefile = r"D:\DEMS\Indian_river_basins\Indian_river_basins_lcc.shp"
+dem_path = r"D:\DEMS\india_lcc.tif"  # Input DEM
+base_output_dir = r"D:\DEMS\all_basins_twi"  # Base TWI output directory
+os.makedirs(base_output_dir, exist_ok=True)
+
+# Path to whitebox_tools.exe
+whitebox_exe = r"D:\TOOLS\WhiteboxTools_win_amd64\WBT\whitebox_tools.exe"
+
+
+def create_safe_name(basin_name):
+    """Create a safe filename from basin name"""
+    import re
+    safe_name = re.sub(r'[<>:"/\\|?*]', '_', str(basin_name).lower().strip())
+    safe_name = re.sub(r'\s+', '_', safe_name)
+    return safe_name
+
+
+def process_single_basin(basin_data, dem_path, base_output_dir, whitebox_exe):
+    """Process a single basin for TWI calculation"""
+    basin_idx, basin_row = basin_data
+    basin_name = basin_row['ba_name']
+    basin_geom = basin_row.geometry
+
+    try:
+        logger.info(f"Starting processing for basin: {basin_name}")
+
+        # Create safe name and output directory for this basin
+        safe_name = create_safe_name(basin_name)
+        output_dir = os.path.join(base_output_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # === WhiteboxTools API setup ===
+        wbt = whitebox.WhiteboxTools()
+        wbt.set_working_dir(output_dir)
+        wbt.verbose = False
+
+        # === File paths ===
+        basin_geometry = [basin_geom]
+
+        # Use temporary files that will be deleted
+        clipped_raw_dem = os.path.join(output_dir, f"temp_{safe_name}_dem_raw.tif")
+        filled_dem_path = os.path.join(output_dir, f"temp_{safe_name}_dem_filled.tif")
+        slope_path = os.path.join(output_dir, f"temp_{safe_name}_slope.tif")
+        flow_acc_path = os.path.join(output_dir, f"temp_{safe_name}_flowacc.tif")
+        twi_path = os.path.join(output_dir, f"temp_{safe_name}_twi.tif")
+        twi_wgs84_path = os.path.join(output_dir, f"{safe_name}_twi_wgs84.tif")  # Only this is kept
+
+        # Skip if final output already exists
+        if os.path.exists(twi_wgs84_path):
+            logger.info(f"TWI already exists for {basin_name}, skipping...")
+            return {"basin": basin_name, "status": "skipped", "message": "Already processed"}
+
+        # === Step 1: Clip DEM to basin ===
+        logger.info(f"[{basin_name}] Step 1: Clipping DEM...")
+        with rasterio.open(dem_path) as src:
+            try:
+                out_image, out_transform = mask(src, basin_geometry, crop=True)
+                out_meta = src.meta.copy()
+                out_meta.update({
+                    "driver": "GTiff",
+                    "height": out_image.shape[1],
+                    "width": out_image.shape[2],
+                    "transform": out_transform
+                })
+                with rasterio.open(clipped_raw_dem, "w", **out_meta) as dest:
+                    dest.write(out_image)
+            except Exception as e:
+                logger.error(f"[{basin_name}] Error clipping DEM: {str(e)}")
+                return {"basin": basin_name, "status": "error", "message": f"DEM clipping failed: {str(e)}"}
+
+        # === Step 2: Fill depressions in DEM ===
+        logger.info(f"[{basin_name}] Step 2: Filling depressions...")
+        try:
+            wbt.fill_depressions(clipped_raw_dem, filled_dem_path)
+        except Exception as e:
+            logger.error(f"[{basin_name}] Error filling depressions: {str(e)}")
+            return {"basin": basin_name, "status": "error", "message": f"Depression filling failed: {str(e)}"}
+
+        # === Step 3: Calculate slope (in radians) ===
+        logger.info(f"[{basin_name}] Step 3: Calculating slope...")
+        try:
+            wbt.slope(filled_dem_path, slope_path, units="radians")
+        except Exception as e:
+            logger.error(f"[{basin_name}] Error calculating slope: {str(e)}")
+            return {"basin": basin_name, "status": "error", "message": f"Slope calculation failed: {str(e)}"}
+
+        # === Step 4: Calculate flow accumulation ===
+        logger.info(f"[{basin_name}] Step 4: Calculating flow accumulation...")
+        try:
+            wbt.d8_flow_accumulation(filled_dem_path, flow_acc_path, out_type="specific contributing area", log=False)
+        except Exception as e:
+            logger.error(f"[{basin_name}] Error calculating flow accumulation: {str(e)}")
+            return {"basin": basin_name, "status": "error", "message": f"Flow accumulation failed: {str(e)}"}
+
+        # === Step 5: Calculate TWI and mask to basin boundary ===
+        logger.info(f"[{basin_name}] Step 5: Calculating TWI...")
+        try:
+            # Read slope and flow accumulation rasters
+            with rasterio.open(slope_path) as slope_src:
+                slope_data = slope_src.read(1)
+                slope_meta = slope_src.meta.copy()
+
+            with rasterio.open(flow_acc_path) as sca_src:
+                sca_data = sca_src.read(1)
+
+            # Add small value to SCA to avoid log(0)
+            sca_data = np.where(sca_data <= 0, 0.001, sca_data + 0.001)
+
+            # Calculate TWI = ln(SCA / tan(slope))
+            slope_data = np.where(slope_data <= 0, 0.001, slope_data)
+            tan_slope = np.tan(slope_data)
+            tan_slope = np.where(tan_slope <= 0, 0.001, tan_slope)
+
+            # Calculate TWI
+            twi_data = np.log(sca_data / tan_slope)
+            twi_data = np.where(np.isfinite(twi_data), twi_data, -9999)
+
+            # Create mask from geometry
+            mask_array = rasterio.features.geometry_mask(
+                basin_geometry,
+                transform=slope_meta['transform'],
+                invert=True,
+                out_shape=(slope_meta['height'], slope_meta['width'])
+            )
+
+            # Apply mask to TWI data
+            masked_twi_data = np.where(mask_array, twi_data, -9999)
+
+            # Save masked TWI (LCC)
+            temp_meta = slope_meta.copy()
+            temp_meta.update(dtype=np.float32, nodata=-9999)
+
+            with rasterio.open(twi_path, 'w', **temp_meta) as dst:
+                dst.write(masked_twi_data.astype(np.float32), 1)
+
+        except Exception as e:
+            logger.error(f"[{basin_name}] Error calculating TWI: {str(e)}")
+            return {"basin": basin_name, "status": "error", "message": f"TWI calculation failed: {str(e)}"}
+
+        # === Step 6: Convert masked TWI to WGS84 ===
+        logger.info(f"[{basin_name}] Step 6: Converting to WGS84...")
+        try:
+            from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+            with rasterio.open(twi_path) as src:
+                transform, width, height = calculate_default_transform(
+                    src.crs, 'EPSG:4326', src.width, src.height, *src.bounds)
+
+                kwargs = src.meta.copy()
+                kwargs.update({
+                    'crs': 'EPSG:4326',
+                    'transform': transform,
+                    'width': width,
+                    'height': height
+                })
+
+                with rasterio.open(twi_wgs84_path, 'w', **kwargs) as dst:
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=rasterio.band(dst, 1),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs='EPSG:4326',
+                        resampling=Resampling.bilinear
+                    )
+        except Exception as e:
+            logger.error(f"[{basin_name}] Error converting to WGS84: {str(e)}")
+            return {"basin": basin_name, "status": "error", "message": f"WGS84 conversion failed: {str(e)}"}
+
+        # === Calculate statistics ===
+        try:
+            with rasterio.open(twi_path) as src:
+                twi_stats = src.read(1)
+
+            valid_twi = twi_stats[twi_stats != -9999]
+            valid_twi = valid_twi[np.isfinite(valid_twi)]
+
+            if len(valid_twi) > 0:
+                stats = {
+                    "min": float(np.min(valid_twi)),
+                    "max": float(np.max(valid_twi)),
+                    "mean": float(np.mean(valid_twi)),
+                    "median": float(np.median(valid_twi)),
+                    "std": float(np.std(valid_twi)),
+                    "valid_pixels": int(len(valid_twi))
+                }
+            else:
+                stats = {"error": "No valid TWI values found"}
+
+        except Exception as e:
+            stats = {"error": f"Statistics calculation failed: {str(e)}"}
+
+        # Clean up ALL temporary files - keep only TWI WGS84
+        try:
+            for temp_file in [clipped_raw_dem, filled_dem_path, slope_path, flow_acc_path, twi_path]:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+        except:
+            pass  # Don't fail if cleanup fails
+
+        logger.info(f"[{basin_name}] Processing completed successfully!")
+        return {
+            "basin": basin_name,
+            "status": "success",
+            "stats": stats,
+            "output_file": twi_wgs84_path  # Only one output file now
+        }
+
+    except Exception as e:
+        logger.error(f"[{basin_name}] Unexpected error: {str(e)}")
+        return {"basin": basin_name, "status": "error", "message": f"Unexpected error: {str(e)}"}
+
+
+def main():
+    """Main function to process all basins"""
+    start_time = time.time()
+
+    # Load shapefile
+    logger.info("Loading basin shapefile...")
+    basins = gpd.read_file(basins_shapefile)
+    logger.info(f"Found {len(basins)} basins to process")
+
+    # Prepare basin data for multiprocessing
+    basin_data = [(idx, row) for idx, row in basins.iterrows()]
+
+    # Determine number of processes (use 75% of available CPUs)
+    num_processes = max(1, int(cpu_count() * 0.85))
+    logger.info(f"Using {num_processes} processes for parallel processing")
+
+    # Create partial function with fixed arguments
+    process_func = partial(
+        process_single_basin,
+        dem_path=dem_path,
+        base_output_dir=base_output_dir,
+        whitebox_exe=whitebox_exe
+    )
+
+    # Process basins in parallel
+    logger.info("Starting parallel processing of all basins...")
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(process_func, basin_data)
+
+    # Summarize results
+    successful = [r for r in results if r["status"] == "success"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+    failed = [r for r in results if r["status"] == "error"]
+
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    logger.info("=" * 60)
+    logger.info("PROCESSING SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Total basins: {len(basins)}")
+    logger.info(f"Successfully processed: {len(successful)}")
+    logger.info(f"Skipped (already processed): {len(skipped)}")
+    logger.info(f"Failed: {len(failed)}")
+    logger.info(f"Total processing time: {total_time / 60:.1f} minutes")
+    logger.info(f"Average time per basin: {total_time / len(basins):.1f} seconds")
+
+    if failed:
+        logger.info("\nFAILED BASINS:")
+        for f in failed:
+            logger.info(f"  - {f['basin']}: {f['message']}")
+
+    # Save summary to file
+    summary_file = os.path.join(base_output_dir, "processing_summary.txt")
+    with open(summary_file, 'w') as f:
+        f.write("TWI Processing Summary\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total basins: {len(basins)}\n")
+        f.write(f"Successfully processed: {len(successful)}\n")
+        f.write(f"Skipped: {len(skipped)}\n")
+        f.write(f"Failed: {len(failed)}\n")
+        f.write(f"Total time: {total_time / 60:.1f} minutes\n\n")
+
+        if successful:
+            f.write("SUCCESSFUL BASINS:\n")
+            for s in successful:
+                f.write(f"  - {s['basin']}\n")
+                if 'stats' in s and 'error' not in s['stats']:
+                    stats = s['stats']
+                    f.write(f"    TWI range: {stats['min']:.2f} to {stats['max']:.2f}\n")
+                    f.write(f"    Mean: {stats['mean']:.2f}, Valid pixels: {stats['valid_pixels']:,}\n")
+
+        if failed:
+            f.write("\nFAILED BASINS:\n")
+            for f_basin in failed:
+                f.write(f"  - {f_basin['basin']}: {f_basin['message']}\n")
+
+    logger.info(f"\nProcessing summary saved to: {summary_file}")
+    logger.info("All basin TWI processing complete!")
+
+
+if __name__ == "__main__":
+    # Import required modules at the top level
+    import rasterio.features
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+    main()
