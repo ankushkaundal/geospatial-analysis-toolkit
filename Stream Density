@@ -1,0 +1,406 @@
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from pyproj import CRS
+import os
+import subprocess
+import whitebox
+import numpy as np
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
+from shapely.geometry import box
+
+# === INPUT PATHS ===
+basins_shapefile = r"D:\DEMS\Indian_river_basins\Indian_river_basins_lcc.shp"
+dem_path = r"D:\DEMS\india_lcc.tif" 
+output_dir = r"D:\DEMS\cauvery_streams4"
+os.makedirs(output_dir, exist_ok=True)
+
+# Path to whitebox_tools.exe
+whitebox_exe = r"D:\TOOLS\WhiteboxTools_win_amd64\WBT\whitebox_tools.exe"
+
+# === WhiteboxTools API setup ===
+wbt = whitebox.WhiteboxTools()
+wbt.set_working_dir(output_dir)
+wbt.verbose = False
+
+# === Load shapefile and extract Cauvery basin ===
+basins = gpd.read_file(basins_shapefile)
+cauvery = basins[basins['ba_name'].str.lower().str.contains("cauvery")]  ### put name of basin in lower casing here
+if cauvery.empty:
+    raise ValueError("Cauvery basin not found in shapefile")
+
+# === Clip DEM to Cauvery ===
+cauvery_geom = [cauvery.iloc[0].geometry]
+safe_name = "cauvery"
+
+clipped_raw_dem = os.path.join(output_dir, f"{safe_name}_dem_raw.tif")
+filled_dem_path = os.path.join(output_dir, f"{safe_name}_dem_filled.tif")
+flow_dir_path = os.path.join(output_dir, f"{safe_name}_flowdir.tif")
+flow_acc_path = os.path.join(output_dir, f"{safe_name}_flowacc.tif")
+streams_raster_path = os.path.join(output_dir, f"{safe_name}_streams.tif")
+stream_order_path = os.path.join(output_dir, f"{safe_name}_stream_order.tif")
+vector_shp = os.path.join(output_dir, f"{safe_name}_streams_all.shp")
+streams_shapefile = os.path.join(output_dir, f"{safe_name}_streams_order1.shp")
+
+# === Step 1: Clip DEM ===
+with rasterio.open(dem_path) as src:
+    out_image, out_transform = mask(src, cauvery_geom, crop=True)
+    out_meta = src.meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": out_image.shape[1],
+        "width": out_image.shape[2],
+        "transform": out_transform
+    })
+    with rasterio.open(clipped_raw_dem, "w", **out_meta) as dest:
+        dest.write(out_image)
+
+print("[STEP 1] DEM clipped to Cauvery")
+
+# === Step 2: Fill DEM ===
+wbt.fill_depressions(clipped_raw_dem, filled_dem_path)
+print("[STEP 2] DEM filled")
+
+# === Step 3: Flow direction (D8) ===
+wbt.d8_pointer(filled_dem_path, flow_dir_path)
+print("[STEP 3] Flow direction created")
+
+# === Step 4: Flow accumulation ===
+wbt.d8_flow_accumulation(filled_dem_path, flow_acc_path, out_type="cells", log=False)
+print(f"[STEP 4] Flow accumulation raster saved: {flow_acc_path}")
+
+# === Step 5: Extract streams using threshold ===
+wbt.extract_streams(flow_acc_path, streams_raster_path, threshold=4000)
+print("[STEP 5] Streams extracted")
+
+# === Step 6: Strahler Stream Order ===
+subprocess.run([
+    whitebox_exe,
+    "--run=StrahlerStreamOrder",
+    f"--d8_pntr={flow_dir_path}",
+    f"--streams={streams_raster_path}",
+    f"--output={stream_order_path}",
+    "--wd", output_dir,
+    "-v"
+], check=True)
+print("[STEP 6] Strahler stream order raster created")
+
+# === Step 7: Vectorize stream order raster ===
+wbt.raster_streams_to_vector(stream_order_path, flow_dir_path, vector_shp)
+print("[STEP 7] Vector stream network (.shp) created")
+
+# === NEW: Convert all streams to WGS84 ===
+streams_all_gdf = gpd.read_file(vector_shp)
+
+# Get CRS from the filled DEM
+with rasterio.open(filled_dem_path) as src:
+    source_crs = src.crs
+
+streams_all_gdf.set_crs(source_crs, inplace=True)
+streams_all_wgs84 = streams_all_gdf.to_crs(epsg=4326)
+vector_shp_wgs84 = os.path.join(output_dir, f"{safe_name}_streams_all_wgs84.shp")
+streams_all_wgs84.to_file(vector_shp_wgs84)
+print(f"[STEP 7b] All streams converted to WGS84: {vector_shp_wgs84}")
+
+
+# === Step 8: Filter stream order >= 2 ===
+streams_gdf = gpd.read_file(vector_shp)
+
+with rasterio.open(filled_dem_path) as src:
+    raster_crs = src.crs
+
+streams_gdf.set_crs(raster_crs, inplace=True)
+
+# Detect order column
+possible_cols = ['stream_order', 'strahler', 'order', 'STRM_VAL']
+order_col = next((col for col in possible_cols if col in streams_gdf.columns), None)
+if not order_col:
+    raise ValueError("No stream order column found in vector data.")
+
+streams_gdf = streams_gdf.rename(columns={order_col: 'stream_order'})
+filtered_streams = streams_gdf[streams_gdf['stream_order'] >= 2]
+
+# === Step 9: Reproject to WGS 84 ===
+filtered_streams = filtered_streams.to_crs(epsg=4326)
+
+# === Step 10: Save final stream shapefile ===
+filtered_streams.to_file(streams_shapefile)
+print(f"[DONE] Stream shapefile saved in WGS 84: {streams_shapefile}")
+
+# ########################   STREAM DENSITY MAPPING   ########################
+
+print("\n=== STARTING STREAM DENSITY CALCULATION ===")
+
+# === Step 11: Keep streams in LCC for accurate length calculations ===
+streams_lcc = streams_gdf[streams_gdf['stream_order'] >= 2].copy()
+streams_lcc.set_crs(raster_crs, inplace=True)  # Keep in original LCC projection
+
+print(f"[STEP 11] Using {len(streams_lcc)} streams with order >= 2")
+
+# === Step 12: Create 1km x 1km grid based on basin boundary ===
+grid_cell_size = 1000  # 1km in meters
+
+# Use basin boundary instead of stream bounds for better coverage
+cauvery_lcc = cauvery.to_crs(raster_crs)
+minx, miny, maxx, maxy = cauvery_lcc.total_bounds
+
+# Align grid to nice round numbers
+minx = np.floor(minx / grid_cell_size) * grid_cell_size
+miny = np.floor(miny / grid_cell_size) * grid_cell_size
+maxx = np.ceil(maxx / grid_cell_size) * grid_cell_size
+maxy = np.ceil(maxy / grid_cell_size) * grid_cell_size
+
+# Create grid
+x_coords = np.arange(minx, maxx + grid_cell_size, grid_cell_size)
+y_coords = np.arange(miny, maxy + grid_cell_size, grid_cell_size)
+
+grid_cells = []
+grid_ids = []
+grid_id = 0
+
+print(f"Creating grid: {len(x_coords) - 1} x {len(y_coords) - 1} cells")
+
+for i in range(len(x_coords) - 1):
+    for j in range(len(y_coords) - 1):
+        cell = box(x_coords[i], y_coords[j], x_coords[i + 1], y_coords[j + 1])
+        # Only include cells that intersect with basin
+        if cell.intersects(cauvery_lcc.iloc[0].geometry):
+            grid_cells.append(cell)
+            grid_ids.append(grid_id)
+        grid_id += 1
+
+# Create grid GeoDataFrame
+grid_gdf = gpd.GeoDataFrame({
+    'grid_id': grid_ids,
+    'geometry': grid_cells
+}, crs=raster_crs)
+
+print(f"[STEP 12] Created {len(grid_gdf)} grid cells (1km x 1km) within basin boundary")
+
+# === Step 13: Calculate stream density per grid cell ===
+print("[STEP 13] Calculating stream density per grid cell...")
+
+# Spatial index for faster intersection
+streams_sindex = streams_lcc.sindex
+
+# Initialize density column
+grid_gdf['stream_length_km'] = 0.0
+grid_gdf['density_km_per_km2'] = 0.0
+
+# Calculate intersections and lengths
+for idx, grid_cell in grid_gdf.iterrows():
+    # Use spatial index to find potential intersections
+    possible_matches_index = list(streams_sindex.intersection(grid_cell.geometry.bounds))
+    possible_matches = streams_lcc.iloc[possible_matches_index]
+
+    # Precise intersection check
+    intersecting_streams = possible_matches[possible_matches.intersects(grid_cell.geometry)]
+
+    if not intersecting_streams.empty:
+        total_length = 0.0
+        for _, stream in intersecting_streams.iterrows():
+            try:
+                # Calculate intersection
+                intersection = stream.geometry.intersection(grid_cell.geometry)
+                if not intersection.is_empty:
+                    # Handle different geometry types
+                    if hasattr(intersection, 'length'):
+                        length_m = intersection.length
+                    elif hasattr(intersection, '__iter__'):
+                        # MultiLineString or GeometryCollection
+                        length_m = sum(geom.length for geom in intersection.geoms if hasattr(geom, 'length'))
+                    else:
+                        length_m = 0.0
+
+                    # Convert length from meters to kilometers
+                    length_km = length_m / 1000.0
+                    total_length += length_km
+            except Exception as e:
+                print(f"Warning: Error processing intersection at grid {idx}: {e}")
+                continue
+
+        grid_gdf.at[idx, 'stream_length_km'] = total_length
+        grid_gdf.at[idx, 'density_km_per_km2'] = total_length  # Since each cell is 1km²
+
+    # Progress indicator
+    if (idx + 1) % 500 == 0:
+        print(f"  Processed {idx + 1}/{len(grid_gdf)} grid cells")
+
+# Remove cells with zero density to reduce file size
+cells_with_streams = len(grid_gdf[grid_gdf['density_km_per_km2'] > 0])
+print(f"[STEP 13] Stream density calculation completed")
+print(f"  Grid cells with streams: {cells_with_streams}/{len(grid_gdf)}")
+print(f"  Max density: {grid_gdf['density_km_per_km2'].max():.3f} km/km²")
+
+# === Step 14: Save grid with density values ===
+# LCC version
+grid_lcc_path = os.path.join(output_dir, f"{safe_name}_stream_density_grid_lcc.shp")
+grid_gdf.to_file(grid_lcc_path)
+print(f"[STEP 13] Stream density grid (LCC) saved: {grid_lcc_path}")
+
+# WGS84 version
+grid_wgs84 = grid_gdf.to_crs(epsg=4326)
+grid_wgs84_path = os.path.join(output_dir, f"{safe_name}_stream_density_grid_wgs84.shp")
+grid_wgs84.to_file(grid_wgs84_path)
+print(f"[STEP 13] Stream density grid (WGS84) saved: {grid_wgs84_path}")
+
+# === Step 15: Create raster density maps ===
+print("[STEP 14] Creating raster density maps...")
+
+
+def create_density_raster_projected(grid_gdf, output_path, target_cell_size_m=1000):
+    """Create raster from grid density values in projected coordinates"""
+
+    # Filter out zero density cells for better processing
+    grid_with_data = grid_gdf[grid_gdf['density_km_per_km2'] > 0].copy()
+
+    if len(grid_with_data) == 0:
+        print("Warning: No cells with stream data found!")
+        return
+
+    # Get bounds from all grid cells (including zeros) for full coverage
+    minx, miny, maxx, maxy = grid_gdf.total_bounds
+
+    # Calculate raster dimensions - ensure exact alignment with target cell size
+    width = int(round((maxx - minx) / target_cell_size_m))
+    height = int(round((maxy - miny) / target_cell_size_m))
+
+    # Ensure minimum dimensions
+    if width <= 0:
+        width = 1
+    if height <= 0:
+        height = 1
+
+    print(f"  Creating raster: {width} x {height} pixels")
+    print(f"  Cells with data: {len(grid_with_data)}")
+    print(
+        f"  Density range: {grid_with_data['density_km_per_km2'].min():.3f} - {grid_with_data['density_km_per_km2'].max():.3f}")
+
+    # Create transform - align with grid boundaries
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    # Create shapes for rasterization - include ALL cells (zeros and non-zeros)
+    shapes = [(geom, value) for geom, value in zip(grid_gdf.geometry, grid_gdf['density_km_per_km2'])]
+
+    # Rasterize with nodata value
+    raster = rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=-9999,  # Use nodata value instead of 0
+        dtype=np.float32,
+        all_touched=True  # Include cells that are partially covered
+    )
+
+    # Save raster with proper nodata handling
+    with rasterio.open(
+            output_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=1,
+            dtype=np.float32,
+            crs=grid_gdf.crs,
+            transform=transform,
+            nodata=-9999,
+            compress='lzw'
+    ) as dst:
+        dst.write(raster, 1)
+
+    # Count non-nodata pixels
+    valid_pixels = np.sum(raster != -9999)
+    print(f"  Valid pixels in raster: {valid_pixels}/{width * height}")
+
+
+def create_density_raster_geographic(grid_gdf, output_path):
+    """Create raster from grid density values in geographic coordinates"""
+
+    # Filter out zero density cells for better processing
+    grid_with_data = grid_gdf[grid_gdf['density_km_per_km2'] > 0].copy()
+
+    if len(grid_with_data) == 0:
+        print("Warning: No cells with stream data found!")
+        return
+
+    # Get bounds from all grid cells
+    minx, miny, maxx, maxy = grid_gdf.total_bounds
+
+    # For geographic coordinates, calculate appropriate resolution
+    # Approximate 1km in degrees (varies by latitude, but roughly 0.01 degrees)
+    deg_per_km = 0.01
+    extent_x = maxx - minx
+    extent_y = maxy - miny
+
+    # Calculate dimensions based on extent and desired resolution
+    width = max(1, int(round(extent_x / deg_per_km)))
+    height = max(1, int(round(extent_y / deg_per_km)))
+
+    print(f"  Creating geographic raster: {width} x {height} pixels")
+    print(f"  Cells with data: {len(grid_with_data)}")
+    print(
+        f"  Density range: {grid_with_data['density_km_per_km2'].min():.3f} - {grid_with_data['density_km_per_km2'].max():.3f}")
+    print(f"  Geographic extent: {extent_x:.4f} x {extent_y:.4f} degrees")
+
+    # Create transform
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    # Create shapes for rasterization
+    shapes = [(geom, value) for geom, value in zip(grid_gdf.geometry, grid_gdf['density_km_per_km2'])]
+
+    # Rasterize with nodata value
+    raster = rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=-9999,
+        dtype=np.float32,
+        all_touched=True
+    )
+
+    # Save raster
+    with rasterio.open(
+            output_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=1,
+            dtype=np.float32,
+            crs=grid_gdf.crs,
+            transform=transform,
+            nodata=-9999,
+            compress='lzw'
+    ) as dst:
+        dst.write(raster, 1)
+
+    # Count non-nodata pixels
+    valid_pixels = np.sum(raster != -9999)
+    print(f"  Valid pixels in raster: {valid_pixels}/{width * height}")
+
+
+# Create LCC raster (projected coordinates)
+density_raster_lcc = os.path.join(output_dir, f"{safe_name}_stream_density_lcc.tif")
+create_density_raster_projected(grid_gdf, density_raster_lcc, 1000)
+print(f"[STEP 14] Stream density raster (LCC) saved: {density_raster_lcc}")
+
+# Create WGS84 raster (geographic coordinates)
+density_raster_wgs84 = os.path.join(output_dir, f"{safe_name}_stream_density_wgs84.tif")
+create_density_raster_geographic(grid_wgs84, density_raster_wgs84)
+print(f"[STEP 14] Stream density raster (WGS84) saved: {density_raster_wgs84}")
+
+# === Step 16: Summary statistics ===
+print(f"\n=== STREAM DENSITY SUMMARY ===")
+print(f"Total grid cells: {len(grid_gdf)}")
+print(f"Cells with streams: {len(grid_gdf[grid_gdf['density_km_per_km2'] > 0])}")
+print(f"Maximum density: {grid_gdf['density_km_per_km2'].max():.2f} km/km²")
+print(f"Mean density: {grid_gdf['density_km_per_km2'].mean():.2f} km/km²")
+print(f"Total stream length: {grid_gdf['stream_length_km'].sum():.2f} km")
+
+print(f"\n=== ALL FILES SAVED ===")
+print(f"Stream shapefile (WGS84): {streams_shapefile}")
+print(f"Density grid (LCC): {grid_lcc_path}")
+print(f"Density grid (WGS84): {grid_wgs84_path}")
+print(f"Density raster (LCC): {density_raster_lcc}")
+print(f"Density raster (WGS84): {density_raster_wgs84}")
